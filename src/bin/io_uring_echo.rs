@@ -1,192 +1,230 @@
 use std::collections::VecDeque;
-use std::io;
 use std::net::TcpListener;
-use std::os::fd::{AsRawFd, RawFd};
-use std::collections::HashMap;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::{io, ptr};
 
-// https://github.com/tokio-rs/io-uring/blob/66844fbe9b10db40faa31e286ed8fc15fc8ab7f2/src/sys/sys.rs#L121C11-L121C28
-const IORING_CQE_F_MORE: u32 = 2;
-
-use io_uring::squeue::Entry;
-use io_uring::types::Fd;
-use io_uring::{opcode, IoUring, SubmissionQueue};
+use io_uring::{opcode, squeue, types, IoUring, SubmissionQueue};
 use slab::Slab;
 
-#[derive(Debug)]
-enum Op {
+#[derive(Clone, Debug)]
+enum Token {
     Accept,
-    Recv(RawFd, u16),
-    Send(RawFd),
-    Close(RawFd),
+    Poll {
+        fd: RawFd,
+    },
+    Read {
+        fd: RawFd,
+        buf_index: usize,
+    },
+    Write {
+        fd: RawFd,
+        buf_index: usize,
+        offset: usize,
+        len: usize,
+    },
 }
 
-impl From<u64> for Op {
-    fn from(value: u64) -> Self {
-        unsafe { std::mem::transmute(value) }
-    }
+pub struct AcceptCount {
+    entry: squeue::Entry,
+    count: usize,
 }
 
-impl From<Op> for u64 {
-    fn from(val: Op) -> Self {
-        unsafe { std::mem::transmute(val) }
-    }
-}
-
-fn push(submission: &mut SubmissionQueue<'_>, entry: Entry, backlog: &mut VecDeque<Entry>) {
-    unsafe {
-        if submission.push(&entry).is_err() {
-            backlog.push_back(entry);
+impl AcceptCount {
+    fn new(fd: RawFd, token: usize, count: usize) -> AcceptCount {
+        AcceptCount {
+            entry: opcode::Accept::new(types::Fd(fd), ptr::null_mut(), ptr::null_mut())
+                .build()
+                .user_data(token as _),
+            count,
         }
     }
+
+    pub fn push_to(&mut self, sq: &mut SubmissionQueue<'_>) {
+        while self.count > 0 {
+            unsafe {
+                match sq.push(&self.entry) {
+                    Ok(_) => self.count -= 1,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        sq.sync();
+    }
 }
 
-fn accept(submission: &mut SubmissionQueue<'_>, fd: RawFd, backlog: &mut VecDeque<Entry>) {
-    let entry = opcode::AcceptMulti::new(Fd(fd))
-        .build()
-        .user_data(Op::Accept.into());
-    push(submission, entry, backlog)
-}
-
-fn recv(
-    submission: &mut SubmissionQueue<'_>,
-    fd: RawFd,
-    buf: *mut u8,
-    buf_len: u32,
-    buf_idx: u16,
-    backlog: &mut VecDeque<Entry>,
-) {
-    let entry = opcode::Recv::new(Fd(fd), buf, buf_len)
-        .build()
-        .user_data(Op::Recv(fd, buf_idx).into());
-    push(submission, entry, backlog)
-}
-
-fn receive(
-    sq: &mut SubmissionQueue<'_>,
-    buf_alloc: &mut Slab<[u8; 1024]>,
-    fd: RawFd,
-    backlog: &mut VecDeque<Entry>,
-) -> u16 {
-    let buf_entry = buf_alloc.vacant_entry();
-    let buf_index = buf_entry.key() as u16;
-    let buf = buf_entry.insert([0u8; 1024]);
-
-    recv(sq, fd, buf.as_mut_ptr(), buf.len() as _, buf_index, backlog);
-    buf_index
-}
-
-fn send(submission: &mut SubmissionQueue<'_>, fd: RawFd, data: &[u8], backlog: &mut VecDeque<Entry>) {
-    let entry = opcode::Send::new(Fd(fd), data.as_ptr(), data.len() as _)
-        .build()
-        .user_data(Op::Send(fd).into());
-    push(submission, entry, backlog)
-}
-
-fn close(submission: &mut SubmissionQueue<'_>, fd: RawFd, backlog: &mut VecDeque<Entry>) {
-    let entry = opcode::Close::new(Fd(fd))
-        .build()
-        .user_data(Op::Close(fd).into());
-    push(submission, entry, backlog)
-}
-
-fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:8083")?;
-    println!("Server listening on {}", listener.local_addr()?);
-
+fn main() -> anyhow::Result<()> {
     let mut ring = IoUring::new(1024)?;
-    let (submitter, mut sq, mut cq) = ring.split();
+    let listener = TcpListener::bind(("127.0.0.1", 8082))?;
 
     let mut backlog = VecDeque::new();
-    // TODO: remove
-    let mut buf_alloc = Slab::with_capacity(2048);
+    let mut bufpool = Vec::with_capacity(64);
+    let mut buf_alloc = Slab::with_capacity(64);
+    let mut token_alloc = Slab::with_capacity(64);
 
-    let mut fd_to_buffer_index: HashMap<RawFd, u16> = HashMap::new();
+    println!("listen {}", listener.local_addr()?);
 
-    // initialize_buffers(&mut sq, &mut bufs, &mut backlog);
-    accept(&mut sq, listener.as_raw_fd(), &mut backlog);
-    sq.sync();
+    let (submitter, mut sq, mut cq) = ring.split();
+
+    let mut accept = AcceptCount::new(listener.as_raw_fd(), token_alloc.insert(Token::Accept), 3);
+
+    accept.push_to(&mut sq);
 
     loop {
         match submitter.submit_and_wait(1) {
             Ok(_) => (),
-            Err(err) => return Err(err),
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => (),
+            Err(err) => return Err(err.into()),
         }
-
-        loop {
-            if cq.is_full() {
-                break;
-            }
-
-            if sq.is_full() {
-                submitter.squeue_wait()?;
-            }
-
-            sq.sync();
-            match backlog.pop_front() {
-                Some(sqe) => {
-                    let _ = unsafe { sq.push(&sqe) };
-                }
-                None => break,
-            };
-        }
-
         cq.sync();
 
-        for cqe in &mut cq {
-            let event = cqe.user_data();
-            let result = cqe.result();
-
-            if result < 0 {
-                eprintln!(
-                    "CQE {:?} failed: {:?}",
-                    Op::from(event),
-                    io::Error::from_raw_os_error(-result)
-                );
-                match Op::from(event) {
-                    Op::Recv(fd, buf_idx) => {
-                        close(&mut sq, fd, &mut backlog);
-                        buf_alloc.remove(buf_idx as usize); 
-                    }
-                    Op::Send(fd) => {
-                        close(&mut sq, fd, &mut backlog);
-                    }
-                    _ => {}
+        // clean backlog
+        loop {
+            if sq.is_full() {
+                match submitter.submit() {
+                    Ok(_) => (),
+                    Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => break,
+                    Err(err) => return Err(err.into()),
                 }
+            }
+            sq.sync();
+
+            match backlog.pop_front() {
+                Some(sqe) => unsafe {
+                    let _ = sq.push(&sqe);
+                },
+                None => break,
+            }
+        }
+
+        accept.push_to(&mut sq);
+
+        for cqe in &mut cq {
+            let ret = cqe.result();
+            let token_index = cqe.user_data() as usize;
+
+            if ret < 0 {
+                eprintln!(
+                    "token {:?} error: {:?}",
+                    token_alloc.get(token_index),
+                    io::Error::from_raw_os_error(-ret)
+                );
                 continue;
             }
 
-            match Op::from(event) {
-                Op::Accept => {
-                    let conn_fd = result;
-                    if cqe.flags() & IORING_CQE_F_MORE == 0 {
-                        accept(&mut sq, listener.as_raw_fd(), &mut backlog);
-                    }
-                    //receive(&mut sq, &mut buf_alloc, conn_fd, &mut backlog);
-                    let buf_idx = receive(&mut sq, &mut buf_alloc, conn_fd, &mut backlog);
-                    fd_to_buffer_index.insert(conn_fd, buf_idx);
-                }
-                Op::Recv(fd, buf_idx) => {
-                    let buf = &buf_alloc[buf_idx as usize];
-                    let received_data = &buf[..result as usize];
-                
-                    if result == 0 {
-                        close(&mut sq, fd, &mut backlog);
-                        buf_alloc.remove(buf_idx as usize); 
-                    } else {
-                        // Echo back the received data
-                        send(&mut sq, fd, received_data, &mut backlog);
+            let token = &mut token_alloc[token_index];
+            match token.clone() {
+                Token::Accept => {
+                    println!("accept");
+
+                    accept.count += 1;
+
+                    let fd = ret;
+                    let poll_token = token_alloc.insert(Token::Poll { fd });
+
+                    let poll_e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
+                        .build()
+                        .user_data(poll_token as _);
+
+                    unsafe {
+                        if sq.push(&poll_e).is_err() {
+                            backlog.push_back(poll_e);
+                        }
                     }
                 }
-                Op::Send(fd) => {
-                    receive(&mut sq, &mut buf_alloc, fd, &mut backlog);
+                Token::Poll { fd } => {
+                    let (buf_index, buf) = match bufpool.pop() {
+                        Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
+                        None => {
+                            let buf = vec![0u8; 2048].into_boxed_slice();
+                            let buf_entry = buf_alloc.vacant_entry();
+                            let buf_index = buf_entry.key();
+                            (buf_index, buf_entry.insert(buf))
+                        }
+                    };
+
+                    *token = Token::Read { fd, buf_index };
+
+                    let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
+                        .build()
+                        .user_data(token_index as _);
+
+                    unsafe {
+                        if sq.push(&read_e).is_err() {
+                            backlog.push_back(read_e);
+                        }
+                    }
                 }
-                Op::Close(fd) => {
-                    if let Some(buf_idx) = fd_to_buffer_index.remove(&fd) {  // Remove and get the buffer index
-                        buf_alloc.remove(buf_idx as usize);
-                        let _ = nix::unistd::close(fd);  // Use the nix crate to handle closing the fd
-                        println!("Connection closed: fd {}", fd);
+                Token::Read { fd, buf_index } => {
+                    if ret == 0 {
+                        bufpool.push(buf_index);
+                        token_alloc.remove(token_index);
+
+                        println!("shutdown");
+
+                        unsafe {
+                            libc::close(fd);
+                        }
                     } else {
-                        eprintln!("Attempted to close an unknown connection: fd {}", fd);
+                        let len = ret as usize;
+                        let buf = &buf_alloc[buf_index];
+
+                        *token = Token::Write {
+                            fd,
+                            buf_index,
+                            len,
+                            offset: 0,
+                        };
+
+                        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                            .build()
+                            .user_data(token_index as _);
+
+                        unsafe {
+                            if sq.push(&write_e).is_err() {
+                                backlog.push_back(write_e);
+                            }
+                        }
+                    }
+                }
+                Token::Write {
+                    fd,
+                    buf_index,
+                    offset,
+                    len,
+                } => {
+                    let write_len = ret as usize;
+
+                    let entry = if offset + write_len >= len {
+                        bufpool.push(buf_index);
+
+                        *token = Token::Poll { fd };
+
+                        opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
+                            .build()
+                            .user_data(token_index as _)
+                    } else {
+                        let offset = offset + write_len;
+                        let len = len - offset;
+
+                        let buf = &buf_alloc[buf_index][offset..];
+
+                        *token = Token::Write {
+                            fd,
+                            buf_index,
+                            offset,
+                            len,
+                        };
+
+                        opcode::Write::new(types::Fd(fd), buf.as_ptr(), len as _)
+                            .build()
+                            .user_data(token_index as _)
+                    };
+
+                    unsafe {
+                        if sq.push(&entry).is_err() {
+                            backlog.push_back(entry);
+                        }
                     }
                 }
             }

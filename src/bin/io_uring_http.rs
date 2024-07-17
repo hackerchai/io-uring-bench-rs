@@ -91,7 +91,7 @@ fn close(submission: &mut SubmissionQueue<'_>, fd: RawFd, backlog: &mut VecDeque
 }
 
 fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:8083")?;
+    let listener = TcpListener::bind("127.0.0.1:8000")?;
     println!("Server listening on {}", listener.local_addr()?);
 
     let mut ring = IoUring::new(1024)?;
